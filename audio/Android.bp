@@ -39,7 +39,6 @@ cc_library_shared {
         "liblog",
         "libsysutils",
         "libtinyalsav2",
-        "libtinycompress",
         "libutils",
     ],
     header_libs: [
@@ -87,6 +86,7 @@ tinyhal_cc_defaults {
         },
         tinyhal_compress_playback: {
             cflags: ["-DTINYHAL_COMPRESS_PLAYBACK"],
+            shared_libs: ["libtinycompress"],
         },
         voice_recof_req_sthal: {
             cflags: ["-DENABLE_STHAL_STREAMS"],
