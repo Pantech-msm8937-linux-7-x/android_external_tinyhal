@@ -625,15 +625,21 @@ static void apply_path_l(struct config_mgr *cm, struct path *path)
     ALOGV("-apply_path_l(%p)", path);
 }
 
+/*
+ * Apply path id of a device, path being that path or NULL if the device has
+ * none. The on and off paths of a device are reference-counted, whether the
+ * device defines them or not: a device with an "on" path and no "off" path
+ * must still be released, else its "on" path is never applied again, so
+ * that a control it shares with another device keeps the other's value.
+ */
 static void apply_device_path_l(struct config_mgr *cm, struct device *pdev,
-                                    struct path *path)
+                                    int id, struct path *path)
 {
-    ALOGV("+apply_device_path_l(%p) id=%u", path, path->id);
+    ALOGV("+apply_device_path_l(%p) id=%d", path, id);
 
-    /* The on and off paths for a device are reference-counted */
-    switch (path->id) {
+    switch (id) {
     case e_path_id_off:
-        if (--pdev->use_count > 0) {
+        if (pdev->use_count > 0 && --pdev->use_count > 0) {
             ALOGV("Device still in use - not applying 'off' path");
             return;
         }
@@ -650,7 +656,9 @@ static void apply_device_path_l(struct config_mgr *cm, struct device *pdev,
         break;
     }
 
-    apply_path_l(cm, path);
+    if (path != NULL) {
+        apply_path_l(cm, path);
+    }
 
     ALOGV("-apply_device_path_l(%p)", path);
 }
@@ -681,12 +689,10 @@ static void apply_paths_by_id_l(struct config_mgr *cm, struct device *pdev,
         }
     }
 
-    if (found_paths[0] != NULL) {
-        apply_device_path_l(cm, pdev, found_paths[0]);
-    }
+    apply_device_path_l(cm, pdev, first_id, found_paths[0]);
 
-    if (found_paths[1] != NULL) {
-        apply_device_path_l(cm, pdev, found_paths[1]);
+    if (second_id != first_id) {
+        apply_device_path_l(cm, pdev, second_id, found_paths[1]);
     }
 }
 
