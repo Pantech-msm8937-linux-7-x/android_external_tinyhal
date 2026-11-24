@@ -1682,9 +1682,14 @@ static int in_resampler_init(struct stream_in_pcm *in, int hw_rate,
     struct in_resampler *rsp = &in->resampler;
     int ret = 0;
 
-    rsp->in_buffer_size = hw_fragment * channels * in->common.frame_size;
-    rsp->in_buffer_frames = rsp->in_buffer_size /
-                                        (channels * in->common.frame_size);
+    /*
+     * A hardware frame is channels samples: frame_size is that of a frame
+     * of the stream (all its channels), so it counted a stereo stream's
+     * channels twice and read two fragments for each one resampled.
+     */
+    rsp->in_buffer_frames = hw_fragment;
+    rsp->in_buffer_size = hw_fragment * channels *
+                          audio_bytes_per_sample(in->common.format);
     rsp->buffer = malloc(rsp->in_buffer_size);
 
     if (!rsp->buffer) {
