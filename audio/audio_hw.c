@@ -1914,6 +1914,10 @@ static int change_input_source_locked(struct stream_in_pcm *in, const char *valu
         stream_name = "voice recognition";
         break;
 
+    case AUDIO_SOURCE_FM_TUNER:
+        stream_name = "fm tuner";
+        break;
+
     default:
         stream_name = NULL;
         break;
@@ -2262,7 +2266,12 @@ static int adev_open_input_stream_v3(struct audio_hw_device *dev,
     *stream_in = NULL;
 
     devices &= AUDIO_DEVICE_IN_ALL;
-    const struct hw_stream *hw = get_stream(adev->cm, devices, 0, config);
+    const struct hw_stream *hw = NULL;
+    /* The FM tuner has its own stream: its audio does not come from the codec */
+    if (source == AUDIO_SOURCE_FM_TUNER)
+        hw = get_named_stream(adev->cm, "fm tuner");
+    if (!hw)
+        hw = get_stream(adev->cm, devices, 0, config);
     if (!hw) {
         ALOGE("No suitable input stream for devices=0x%x flags=0x%x format=0x%x",
               devices, flags, config->format);
@@ -2288,6 +2297,9 @@ static int adev_open_input_stream_v3(struct audio_hw_device *dev,
     if (ret < 0) {
         goto fail;
     }
+    /* already on the stream of the FM tuner: keep it on the input_source set_parameter() */
+    if (source == AUDIO_SOURCE_FM_TUNER)
+        in->common.input_source = source;
 
     ret = do_init_in_pcm(in, config);
     if (ret < 0) {

@@ -1327,6 +1327,7 @@ static const struct parse_device device_table[] = {
     {"back mic",    AUDIO_DEVICE_IN_BACK_MIC},
     {"voice",       AUDIO_DEVICE_IN_VOICE_CALL},
     {"aux",         AUDIO_DEVICE_IN_AUX_DIGITAL},
+    {"fm_tuner",    AUDIO_DEVICE_IN_FM_TUNER},
     {"hdmi",        AUDIO_DEVICE_OUT_HDMI},
 };
 
