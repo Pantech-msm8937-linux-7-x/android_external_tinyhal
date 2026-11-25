@@ -411,6 +411,20 @@ static int out_set_parameters(struct audio_stream *stream, const char *kvpairs)
 
     ret = common_get_routing_param(&v, kvpairs);
 
+    /*
+     * The loudspeaker amplifier on SoundWire only gets in step with a
+     * stream it joins when the stream starts: one moved onto or off it
+     * while playing comes out broken for a while. Restart the stream on
+     * the next write instead.
+     */
+    if (ret >= 0 && v && stream_is_pcm_out(out->hw) &&
+        ((get_current_routes(out->hw) ^ v) & AUDIO_DEVICE_OUT_SPEAKER)) {
+        pthread_mutex_lock(&out->lock);
+        do_out_pcm_standby((struct stream_out_pcm *)out);
+        apply_route(out->hw, v);
+        pthread_mutex_unlock(&out->lock);
+    }
+
     pthread_mutex_lock(&adev->lock);
 
     if (ret >= 0) {
