@@ -24,6 +24,7 @@
 
 #include <errno.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -52,6 +53,10 @@
 #include <audio_utils/resampler.h>
 
 #include <tinyhal/audio_config.h>
+
+#ifndef ARRAY_SIZE
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#endif
 
 #include <math.h>
 
@@ -115,7 +120,29 @@ struct audio_device {
     struct config_mgr *cm;
 
     const struct hw_stream *global_stream;
+
+    /* Voice call, see voice_start_l() */
+    audio_mode_t mode;
+    uint32_t out_devices;   /* last routing of the output streams */
+    uint32_t active_vsid;   /* session the modem reports active, or 0 */
+    struct {
+        uint32_t vsid;
+        const struct hw_stream *out_hw;
+        const struct hw_stream *in_hw;
+        struct pcm *rx;
+        struct pcm *tx;
+    } voice;
+
+    /* The open PCM output streams, see voice_start_l() */
+    struct stream_out_pcm *pcm_outs[8];
 };
+
+struct stream_out_pcm;
+static void do_out_pcm_standby(struct stream_out_pcm *out);
+
+static void voice_route_l(struct audio_device *adev);
+static void voice_set_parameters_l(struct audio_device *adev,
+                                   struct str_parms *parms);
 
 
 typedef void(*out_close_fn)(struct audio_stream_out *);
@@ -388,6 +415,10 @@ static int out_set_parameters(struct audio_stream *stream, const char *kvpairs)
 
     if (ret >= 0) {
         apply_route(out->hw, v);
+        if (v) {
+            adev->out_devices = v;
+            voice_route_l(adev);
+        }
     }
 
     stream_invoke_usecases(out->hw, kvpairs);
@@ -2198,6 +2229,18 @@ static int adev_open_output_stream_v3(struct audio_hw_device *dev,
 
     if (hw->type == e_stream_out_pcm) {
         ret = do_init_out_pcm(out.pcm, config);
+        if (ret >= 0) {
+            unsigned int i;
+
+            pthread_mutex_lock(&adev->lock);
+            for (i = 0; i < ARRAY_SIZE(adev->pcm_outs); i++) {
+                if (!adev->pcm_outs[i]) {
+                    adev->pcm_outs[i] = out.pcm;
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&adev->lock);
+        }
     } else {
 #ifdef TINYHAL_COMPRESS_PLAYBACK
         ret = do_init_out_compress(out.compress, config);
@@ -2231,7 +2274,18 @@ static void adev_close_output_stream(struct audio_hw_device *dev,
                                      struct audio_stream_out *stream)
 {
     struct stream_out_common *out = (struct stream_out_common *)stream;
+    struct audio_device *adev = (struct audio_device *)dev;
+    unsigned int i;
+
     ALOGV("adev_close_output_stream(%p)", stream);
+
+    pthread_mutex_lock(&adev->lock);
+    for (i = 0; i < ARRAY_SIZE(adev->pcm_outs); i++) {
+        if (adev->pcm_outs[i] == (struct stream_out_pcm *)out)
+            adev->pcm_outs[i] = NULL;
+    }
+    pthread_mutex_unlock(&adev->lock);
+
     (out->close)(stream);
 }
 
@@ -2375,6 +2429,14 @@ static int adev_set_parameters(struct audio_hw_device *dev, const char *kvpairs)
         stream_invoke_usecases(adev->global_stream, kvpairs);
     }
 
+    parms = str_parms_create_str(kvpairs);
+    if (parms) {
+        pthread_mutex_lock(&adev->lock);
+        voice_set_parameters_l(adev, parms);
+        pthread_mutex_unlock(&adev->lock);
+        str_parms_destroy(parms);
+    }
+
     return 0;
 }
 
@@ -2399,8 +2461,197 @@ static int adev_set_master_volume(struct audio_hw_device *dev, float volume)
     return -ENOSYS;
 }
 
+
+/*********************************************************************
+ * Voice call
+ *
+ * The modem and the DSP carry the call audio between themselves. The HAL
+ * only starts the voice session, by opening both directions of its front
+ * end PCM, and routes the codec. The radio interface layer names the
+ * session of the call with "vsid=<id>;call_state=2" parameters (VoLTE
+ * calls use another one than circuit switched calls): the "voice call
+ * <vsid>" stream connects that session to the back ends and gives its PCM.
+ * The output streams already route the output device, the "voice call
+ * mic" stream routes the microphone that goes with it.
+ *********************************************************************/
+
+#define VOICE_CALL_ACTIVE 2
+
+static uint32_t voice_mic_for(uint32_t out_devices)
+{
+    if (out_devices & AUDIO_DEVICE_OUT_WIRED_HEADSET)
+        return AUDIO_DEVICE_IN_WIRED_HEADSET;
+    return AUDIO_DEVICE_IN_BUILTIN_MIC;
+}
+
+static void voice_route_l(struct audio_device *adev)
+{
+    if (!adev->voice.out_hw)
+        return;
+
+    apply_route(adev->voice.out_hw, adev->out_devices);
+    if (adev->voice.in_hw)
+        apply_route(adev->voice.in_hw, voice_mic_for(adev->out_devices));
+}
+
+static struct pcm *voice_open_pcm(unsigned int card, unsigned int device,
+                                  unsigned int flags)
+{
+    /* q6voice-dai takes periods of 2048 to 4096 bytes */
+    struct pcm_config config = {
+        .channels = 1,
+        .rate = 8000,
+        .period_size = 1024,
+        .period_count = 2,
+        .format = PCM_FORMAT_S16_LE,
+        /*
+         * Nothing is ever written or read: never stop for lack of data,
+         * and let playback start with an empty buffer
+         */
+        .start_threshold = 1,
+        .stop_threshold = UINT_MAX,
+    };
+    struct pcm *pcm = pcm_open(card, device, flags, &config);
+
+    if (!pcm || !pcm_is_ready(pcm)) {
+        ALOGE("voice: cannot open pcm %u:%u %s: %s", card, device,
+              flags & PCM_IN ? "in" : "out", pcm ? pcm_get_error(pcm) : "");
+        if (pcm)
+            pcm_close(pcm);
+        return NULL;
+    }
+    /*
+     * Starting it starts the back ends: the codec only enables its SLIMbus
+     * channels on the trigger, before that the DSP sends into a closed port
+     */
+    if (pcm_start(pcm) < 0)
+        ALOGE("voice: cannot start pcm %u:%u: %s", card, device,
+              pcm_get_error(pcm));
+    return pcm;
+}
+
+static void voice_stop_l(struct audio_device *adev)
+{
+    if (!adev->voice.out_hw)
+        return;
+
+    if (adev->voice.rx)
+        pcm_close(adev->voice.rx);
+    if (adev->voice.tx)
+        pcm_close(adev->voice.tx);
+    adev->voice.rx = NULL;
+    adev->voice.tx = NULL;
+
+    if (adev->voice.in_hw) {
+        apply_route(adev->voice.in_hw, 0);
+        release_stream(adev->voice.in_hw);
+    }
+    apply_route(adev->voice.out_hw, 0);
+    release_stream(adev->voice.out_hw);
+    adev->voice.in_hw = NULL;
+    adev->voice.out_hw = NULL;
+    ALOGI("voice: session %08" PRIX32 " stopped", adev->voice.vsid);
+    adev->voice.vsid = 0;
+}
+
+static void voice_start_l(struct audio_device *adev, uint32_t vsid)
+{
+    uint32_t card = 0, device = 0;
+    char name[32];
+    unsigned int i;
+
+    snprintf(name, sizeof(name), "voice call %08" PRIX32, vsid);
+    adev->voice.out_hw = get_named_stream(adev->cm, name);
+    if (!adev->voice.out_hw) {
+        ALOGW("voice: no \"%s\" stream", name);
+        return;
+    }
+    adev->voice.vsid = vsid;
+    adev->voice.in_hw = get_named_stream(adev->cm, "voice call mic");
+    get_stream_constant_uint32(adev->voice.out_hw, "card", &card);
+    if (get_stream_constant_uint32(adev->voice.out_hw, "device", &device) < 0) {
+        ALOGE("voice: the \"%s\" stream sets no device", name);
+        voice_stop_l(adev);
+        return;
+    }
+
+    if (!adev->out_devices)
+        adev->out_devices = AUDIO_DEVICE_OUT_EARPIECE;
+    voice_route_l(adev);
+
+    /*
+     * The voice session has to start the back end itself: joining a back
+     * end some playback (the dial pad tones) started leaves the call
+     * silent. Put the outputs in standby and hold them there until the
+     * session runs, they reopen on their next write.
+     */
+    for (i = 0; i < ARRAY_SIZE(adev->pcm_outs); i++) {
+        if (adev->pcm_outs[i]) {
+            pthread_mutex_lock(&adev->pcm_outs[i]->common.lock);
+            do_out_pcm_standby(adev->pcm_outs[i]);
+        }
+    }
+
+    /* The session starts once both directions are open */
+    adev->voice.rx = voice_open_pcm(card, device, PCM_OUT);
+    adev->voice.tx = voice_open_pcm(card, device, PCM_IN);
+
+    for (i = 0; i < ARRAY_SIZE(adev->pcm_outs); i++) {
+        if (adev->pcm_outs[i])
+            pthread_mutex_unlock(&adev->pcm_outs[i]->common.lock);
+    }
+    if (!adev->voice.rx || !adev->voice.tx) {
+        voice_stop_l(adev);
+        return;
+    }
+    ALOGI("voice: session %08" PRIX32 " started on pcm %u:%u, out devices 0x%x",
+          vsid, card, device, adev->out_devices);
+}
+
+/* Runs the session the modem reports active while the mode is in call */
+static void voice_update_l(struct audio_device *adev)
+{
+    uint32_t want = adev->mode == AUDIO_MODE_IN_CALL ? adev->active_vsid : 0;
+
+    if (adev->voice.out_hw && adev->voice.vsid == want)
+        return;
+    voice_stop_l(adev);
+    if (want)
+        voice_start_l(adev, want);
+}
+
+static void voice_set_parameters_l(struct audio_device *adev,
+                                   struct str_parms *parms)
+{
+    char value[32];
+    uint32_t vsid;
+    int state;
+
+    if (str_parms_get_str(parms, "vsid", value, sizeof(value)) < 0)
+        return;
+    vsid = strtoul(value, NULL, 10);
+    if (str_parms_get_str(parms, "call_state", value, sizeof(value)) < 0)
+        return;
+    state = atoi(value);
+
+    if (state == VOICE_CALL_ACTIVE)
+        adev->active_vsid = vsid;
+    else if (adev->active_vsid == vsid)
+        adev->active_vsid = 0;
+    voice_update_l(adev);
+}
+
 static int adev_set_mode(struct audio_hw_device *dev, audio_mode_t mode)
 {
+    struct audio_device *adev = (struct audio_device *)dev;
+
+    ALOGV("adev_set_mode(%d)", mode);
+
+    pthread_mutex_lock(&adev->lock);
+    adev->mode = mode;
+    voice_update_l(adev);
+    pthread_mutex_unlock(&adev->lock);
+
     return 0;
 }
 
