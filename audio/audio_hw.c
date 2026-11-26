@@ -2621,17 +2621,42 @@ static struct pcm *voice_open_pcm(unsigned int card, unsigned int device,
     return pcm;
 }
 
+/*
+ * The voice session has to start and stop the back end on its own: a
+ * playback joining the back end of the other (the dial pad tones before a
+ * call, a notification during one) stays silent or keeps running into
+ * underruns afterwards. Hold the PCM outputs in standby around starting
+ * and stopping the session, they reopen on their next write.
+ */
+static void voice_hold_outputs_l(struct audio_device *adev, bool hold)
+{
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(adev->pcm_outs); i++) {
+        if (!adev->pcm_outs[i])
+            continue;
+        if (hold) {
+            pthread_mutex_lock(&adev->pcm_outs[i]->common.lock);
+            do_out_pcm_standby(adev->pcm_outs[i]);
+        } else {
+            pthread_mutex_unlock(&adev->pcm_outs[i]->common.lock);
+        }
+    }
+}
+
 static void voice_stop_l(struct audio_device *adev)
 {
     if (!adev->voice.out_hw)
         return;
 
+    voice_hold_outputs_l(adev, true);
     if (adev->voice.rx)
         pcm_close(adev->voice.rx);
     if (adev->voice.tx)
         pcm_close(adev->voice.tx);
     adev->voice.rx = NULL;
     adev->voice.tx = NULL;
+    voice_hold_outputs_l(adev, false);
 
     if (adev->voice.in_hw) {
         apply_route(adev->voice.in_hw, 0);
@@ -2651,7 +2676,6 @@ static void voice_start_l(struct audio_device *adev, uint32_t vsid)
 {
     uint32_t card = 0, device = 0;
     char name[32];
-    unsigned int i;
 
     snprintf(name, sizeof(name), "voice call %08" PRIX32, vsid);
     adev->voice.out_hw = get_named_stream(adev->cm, name);
@@ -2672,27 +2696,11 @@ static void voice_start_l(struct audio_device *adev, uint32_t vsid)
         adev->out_devices = AUDIO_DEVICE_OUT_EARPIECE;
     voice_route_l(adev);
 
-    /*
-     * The voice session has to start the back end itself: joining a back
-     * end some playback (the dial pad tones) started leaves the call
-     * silent. Put the outputs in standby and hold them there until the
-     * session runs, they reopen on their next write.
-     */
-    for (i = 0; i < ARRAY_SIZE(adev->pcm_outs); i++) {
-        if (adev->pcm_outs[i]) {
-            pthread_mutex_lock(&adev->pcm_outs[i]->common.lock);
-            do_out_pcm_standby(adev->pcm_outs[i]);
-        }
-    }
-
     /* The session starts once both directions are open */
+    voice_hold_outputs_l(adev, true);
     adev->voice.rx = voice_open_pcm(card, device, PCM_OUT);
     adev->voice.tx = voice_open_pcm(card, device, PCM_IN);
-
-    for (i = 0; i < ARRAY_SIZE(adev->pcm_outs); i++) {
-        if (adev->pcm_outs[i])
-            pthread_mutex_unlock(&adev->pcm_outs[i]->common.lock);
-    }
+    voice_hold_outputs_l(adev, false);
     if (!adev->voice.rx || !adev->voice.tx) {
         voice_stop_l(adev);
         return;
