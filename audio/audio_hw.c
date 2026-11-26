@@ -803,7 +803,7 @@ static int start_output_pcm(struct stream_out_pcm *out)
 
     out->pcm = pcm_open(out->common.hw->card_number,
                         out->common.hw->device_number,
-                        PCM_OUT | PCM_MONOTONIC,
+                        PCM_OUT | PCM_MONOTONIC | PCM_NORESTART,
                         &config);
 
     if (out->pcm && !pcm_is_ready(out->pcm)) {
@@ -904,6 +904,20 @@ static ssize_t out_pcm_write(struct audio_stream_out *stream, const void *buffer
 
     ret = pcm_write(out->pcm, buffer, bytes);
     ALOGV_IF(ret < 0, "out_pcm_write: pcm_write failed: %d", ret);
+    if (ret < 0 && errno == EPIPE) {
+        /*
+         * Reopen the PCM on an underrun rather than let it be prepared
+         * again: the q6asm front end restarted that way keeps
+         * underrunning, the DSP hands the periods back unplayed.
+         */
+        ALOGW("out_pcm_write: underrun, reopening the pcm");
+        do_out_pcm_standby(out);
+        ret = start_output_pcm(out);
+        if (ret != 0)
+            goto exit;
+        out->common.standby = false;
+        ret = pcm_write(out->pcm, buffer, bytes);
+    }
     if (ret >= 0) {
         out->frames_written += pcm_bytes_to_frames(out->pcm, bytes);
         get_pcm_timestamp(out->pcm, out->common.sample_rate, &out->timestamp, true /*is_output*/);
