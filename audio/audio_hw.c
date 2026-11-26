@@ -135,12 +135,18 @@ struct audio_device {
 
     /* The open PCM output streams, see voice_start_l() */
     struct stream_out_pcm *pcm_outs[8];
+
+    float voice_volume;
+    /* Gains of the call volume controls before the call, see below */
+    int voice_gain[8];
+    bool voice_gain_saved;
 };
 
 struct stream_out_pcm;
 static void do_out_pcm_standby(struct stream_out_pcm *out);
 
 static void voice_route_l(struct audio_device *adev);
+static void voice_set_volume_l(struct audio_device *adev, float volume);
 static void voice_set_parameters_l(struct audio_device *adev,
                                    struct str_parms *parms);
 
@@ -2465,8 +2471,79 @@ static int adev_init_check(const struct audio_hw_device *dev)
     return 0;
 }
 
+/*
+ * Call volume and microphone mute, as the "global" stream of the config
+ * describes them:
+ *   "voice volume ctls"      comma separated mixer controls of the gain of
+ *                            the paths a call plays on, in steps of 1 dB
+ *   "voice volume max db"    the gain of the highest volume above the gain
+ *                            the controls have outside calls (optional, 0)
+ *   "voice volume range db"  the gain of the lowest volume below the highest
+ *   "voice mute ctl"         the switch muting the microphone of calls
+ * The volume Android gives (0 to 1) maps linearly onto the dB range, from
+ * the gains the controls had when the call started, which they get back
+ * when it ends (a negative volume).
+ */
+static void set_ctl_all(struct mixer *mixer, const char *name, int val)
+{
+    struct mixer_ctl *ctl = mixer_get_ctl_by_name(mixer, name);
+    unsigned int i;
+
+    if (!ctl) {
+        ALOGW("no mixer control '%s'", name);
+        return;
+    }
+    for (i = 0; i < mixer_ctl_get_num_values(ctl); i++)
+        mixer_ctl_set_value(ctl, i, val);
+}
+
+static void voice_set_volume_l(struct audio_device *adev, float volume)
+{
+    struct mixer *mixer = get_mixer(adev->cm);
+    const char *ctls = NULL;
+    int max_db = 0, range_db = 0, offset;
+    char buf[256], *name, *save;
+    unsigned int n = 0;
+
+    if (!adev->global_stream ||
+        get_stream_constant_string(adev->global_stream, "voice volume ctls", &ctls) < 0 ||
+        get_stream_constant_int32(adev->global_stream, "voice volume range db", &range_db) < 0)
+        return;
+    get_stream_constant_int32(adev->global_stream, "voice volume max db", &max_db);
+
+    if (volume < 0.0f && !adev->voice_gain_saved)
+        return;
+    if (volume > 1.0f)
+        volume = 1.0f;
+    offset = max_db - (int)lroundf((1.0f - volume) * range_db);
+
+    strlcpy(buf, ctls, sizeof(buf));
+    for (name = strtok_r(buf, ",", &save); name && n < ARRAY_SIZE(adev->voice_gain);
+         name = strtok_r(NULL, ",", &save), n++) {
+        struct mixer_ctl *ctl = mixer_get_ctl_by_name(mixer, name);
+
+        if (!ctl) {
+            ALOGW("no mixer control '%s'", name);
+            continue;
+        }
+        if (!adev->voice_gain_saved)
+            adev->voice_gain[n] = mixer_ctl_get_value(ctl, 0);
+        set_ctl_all(mixer, name, volume < 0.0f ? adev->voice_gain[n]
+                                               : adev->voice_gain[n] + offset);
+    }
+    adev->voice_gain_saved = volume >= 0.0f;
+}
+
 static int adev_set_voice_volume(struct audio_hw_device *dev, float volume)
 {
+    struct audio_device *adev = (struct audio_device *)dev;
+
+    pthread_mutex_lock(&adev->lock);
+    adev->voice_volume = volume;
+    if (adev->voice.out_hw)
+        voice_set_volume_l(adev, volume);
+    pthread_mutex_unlock(&adev->lock);
+
     return 0;
 }
 
@@ -2564,6 +2641,8 @@ static void voice_stop_l(struct audio_device *adev)
     release_stream(adev->voice.out_hw);
     adev->voice.in_hw = NULL;
     adev->voice.out_hw = NULL;
+    /* Give the playback paths their gains back */
+    voice_set_volume_l(adev, -1.0f);
     ALOGI("voice: session %08" PRIX32 " stopped", adev->voice.vsid);
     adev->voice.vsid = 0;
 }
@@ -2618,6 +2697,7 @@ static void voice_start_l(struct audio_device *adev, uint32_t vsid)
         voice_stop_l(adev);
         return;
     }
+    voice_set_volume_l(adev, adev->voice_volume);
     ALOGI("voice: session %08" PRIX32 " started on pcm %u:%u, out devices 0x%x",
           vsid, card, device, adev->out_devices);
 }
@@ -2672,8 +2752,15 @@ static int adev_set_mode(struct audio_hw_device *dev, audio_mode_t mode)
 static int adev_set_mic_mute(struct audio_hw_device *dev, bool state)
 {
     struct audio_device *adev = (struct audio_device *)dev;
+    const char *ctl;
 
+    pthread_mutex_lock(&adev->lock);
     adev->mic_mute = state;
+    /* The DSP keeps it for the calls to come too */
+    if (adev->global_stream &&
+        get_stream_constant_string(adev->global_stream, "voice mute ctl", &ctl) == 0)
+        set_ctl_all(get_mixer(adev->cm), ctl, state);
+    pthread_mutex_unlock(&adev->lock);
 
     return 0;
 }
@@ -2765,6 +2852,7 @@ static int adev_open(const hw_module_t *module, const char *name,
     }
 
     adev->global_stream = get_named_stream(adev->cm, "global");
+    adev->voice_volume = 1.0f;
 
     *device = &adev->hw_device.common;
 
